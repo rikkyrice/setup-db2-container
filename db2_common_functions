@@ -1,0 +1,776 @@
+#!/bin/bash
+
+###############################################################################
+#   Common functions to initialize DB2 in a Docker container
+#
+# Copyright 2017, IBM Corporation
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+###############################################################################
+
+source ${SETUPDIR?}/include/db2_constants
+source ${SETUPDIR?}/include/hadr_functions.sh
+
+create_users()
+{
+   echo "(*) Creating users ..."
+   password=`echo "${DB2INST1_PASSWORD?}" | openssl passwd -1 -stdin`
+   dirname ${DB2INSTANCE_HOME?} | xargs mkdir -p $1
+   groupadd ${INST_GROUP?} && useradd -m -d ${DB2INSTANCE_HOME?} -g ${INST_GROUP?} -s /bin/bash -p ${password?} ${DB2INSTANCE?}
+   groupadd ${FENCED_GROUP?} && useradd -m -d ${DB2FENCED_HOME?} -g ${FENCED_GROUP?} -s /bin/bash ${FENCED_USER?}
+}
+
+create_instance()
+{
+   rc=${TRUE?}
+
+   if [ -f ${DB2INSTANCE_HOME?}/sqllib/db2profile ]; then
+     echo "(*) Preparing the environment before updating the instance ... "
+     create_services_file
+     fix_hosts_file
+
+     # Workaround to prevent SQL1072C during stop/start in case Db2 was not stopped gracefully.
+     # ipclean -a <some options> should be called here instead. However, ipclean is not able to distinguish
+     # two instances from two different containers running on the same host (yet).
+     # The downside of having to call db2ftok here when instance is not stopped gracefully is it
+     # could leave IPC resources lying around on the system so this should only be temporary.
+     if [ -f ${CONFIG_DIR?}/${DB2INSTANCE?}/sqllib/.ftok ]; then
+       su - ${DB2INSTANCE?} -c 'rm -f sqllib/.ftok ; sqllib/bin/db2ftok'
+
+       su - ${DB2INSTANCE?} -c 'db2stop force'
+       ${DB2DIR?}/instance/db2ickts -s ${DB2INSTANCE?}
+     fi
+   fi
+
+   echo "(*) Creating instance ... "
+   if ! ${DB2DIR?}/instance/db2icrt -update-instance-if-exists -u ${FENCED_USER?} ${DB2INSTANCE?}; then
+      echo "(!) There was a problem configuring the instance. Copying over logs and traces to ${STORAGE_DIR?}/config ..."
+      mkdir ${CONFIG_DIR?}/db2icrt
+      cp /tmp/*db2* ${CONFIG_DIR?}/db2icrt/
+      ${DB2DIR?}/bin/db2support ${CONFIG_DIR?}/db2icrt -install
+      return ${FALSE?}
+   fi
+
+   # During upgrade to 11.5 in container, the fencedid is owned by the instance
+   # and causes a security error in db2diag
+   chown root.root ${CONFIG_DIR?}/${DB2INSTANCE?}/sqllib/adm/fencedid
+ 
+   ${DB2DIR?}/install/db2ls -q -f TEXT_SEARCH -b ${DB2DIR?} > /dev/null 2>&1
+   is_text_search_installed=$?
+
+   ${DB2DIR?}/instance/db2ickts -k ${DB2INSTANCE?}
+   is_text_search_configured=$?
+
+   if [ ${is_text_search_installed?} -eq ${TRUE?} -a ${is_text_search_configured?} -ne ${TRUE?} ]; then
+
+      echo "(*) Enabling TEXT_SEARCH for instance ..."
+      if ! ${DB2DIR?}/instance/db2iupdt -j "TEXT_SEARCH" ${DB2INSTANCE?}; then
+        echo "(!) There was a problem enabling TEXT_SEARCH ..."
+        return ${FALSE?}
+      fi
+
+   fi
+
+   su - ${DB2INSTANCE?} -c 'db2stop force'
+   ${DB2DIR?}/instance/db2ickts -s ${DB2INSTANCE?}
+
+   chown ${DB2INSTANCE?} ${DB2INSTANCE_HOME?}/sqllib/adm/.fenced
+   mkdir -p ${DATA_DIR?} && chown -R ${DB2INSTANCE?}:${INST_GROUP?} $DATA_DIR
+   mkdir -p ${CONFIG_DIR?}/licenses && chown -R ${DB2INSTANCE?}:${INST_GROUP?} ${CONFIG_DIR?}/licenses
+
+   return ${rc?}
+
+}
+
+#**********
+# If DB2DEVCE is true, we need to enable backward compatibility
+# for older containers that use /db2fs as DFTDBPATH
+#**********
+enable_backward_compat()
+{
+  echo "(*) Copying data from /db2fs ..."
+  mkdir -p ${DATA_DIR?}/${DB2INSTANCE?} && mv ${STORAGE_DIR?}/${DB2INSTANCE?} ${DATA_DIR?}
+  mkdir -p ${DBLOG_DIR?} && mv ${STORAGE_DIR?}/db2logs/* ${DBLOG_DIR?}/
+  ln -s ${DATA_DIR?} /db2fs
+  ln -s ${DBLOG_DIR?} /db2fs/db2logs
+  mv -f ${STORAGE_DIR?}/db2cfg/* ${CONFIG_DIR?}/
+  mv ${STORAGE_DIR?}/backups ${BACKUP_DIR?}  
+
+  for db in `ls ${DATA_DIR?}/${DB2INSTANCE?}/NODE0000 | grep -vi SQL`; do
+     restore_db_from_existing $db
+  done
+
+}
+
+#**********
+# If DB2DEVCE is true, we may need to recatalog
+# the database if it is present
+#**********
+catalog_database()
+{
+  for db in $( ls ${DATA_DIR?}/${DB2INSTANCE?}/NODE0000 | grep -vi SQL ); do 
+     restore_db_from_existing ${db?}
+  done
+}
+#**********
+# Compute a memory percentage value based on the N% of the memory from
+# crgoup / total RAM ratio and return the value rounded to the nearest floor integer.
+#**********
+normalize_mem_perc()
+{
+  local mem_perc=$1
+  local pod_id=$(grep memory /proc/1/cgroup | awk -F'/' '{print $4}')
+  local pod_mem_limit=$(cat /sys/fs/cgroup/memory/kubepods/burstable/${pod_id?}/memory.limit_in_bytes | tr -d '\n')
+
+  local pod_mem_limit_MB=$(bc <<< "${pod_mem_limit?} / (1024 * 1024)")
+  local host_mem_MB=$(free -m | awk '/Mem/ {print $2}' | bc)
+  local mem_perc_normalized=$(bc <<<"scale=0;${mem_perc?}*${pod_mem_limit_MB?}/${host_mem_MB?}")
+
+  echo ${mem_perc_normalized?}
+}
+
+set_dbm_cfg()
+{
+  echo "(*) Updating DBM CFG parameters ... "
+  su - ${DB2INSTANCE?} -c ". sqllib/db2profile; db2set DB2COMM=TCPIP && db2 UPDATE DBM CFG USING DFTDBPATH $DATA_DIR IMMEDIATE"
+  su - ${DB2INSTANCE?} -c "db2 UPDATE DBM CFG USING SVCENAME db2c_${DB2INSTANCE?}"
+  su - ${DB2INSTANCE?} -c "db2 UPDATE DBM CFG USING FEDERATED YES"
+  
+  # Need to set the registry variable when running on ICP because the
+  # pod IP changes during restart
+  if [ "${HADR_ENABLED?}" = "true" ]; then
+    su - ${DB2INSTANCE?} -c "db2set DB2_HADR_NO_IP_CHECK=ON"
+  fi
+
+  
+  if [ "true" = ${IS_KUBE?} ]; then  
+    echo "(*) k8s environment flagged. Setting Db2 INSTANCE_MEMORY. "
+    max_instance_mem_perc=$(normalize_mem_perc 90)
+    if [[ "$max_instance_mem_perc" -le  100 ]];then
+      echo "(*) Setting INSTANCE_MEMORY to ${max_instance_mem_perc}%"
+      su - ${DB2INSTANCE?} -c "db2 UPDATE DBM CFG USING INSTANCE_MEMORY ${max_instance_mem_perc}"
+    else
+      echo "The Cgroup percentage is greater than 100 so we are likely not within a k8s pod, instance memory will follow automatic tuning"
+    fi
+  else
+    echo "No Cgroup memory limit detected, instance memory will follow automatic tuning" 
+  fi
+}
+
+# Enable database for text search
+configure_text_search()
+{
+   dbname=$1
+
+   ${DB2DIR?}/instance/db2ickts -k ${DB2INSTANCE?}
+   is_text_search_configured=$?
+
+   if [ ${is_text_search_configured?} -ne ${TRUE?} ]; then
+     echo "(*) Skipping TEXT_SEARCH setup for database ${dbname?} because TEXT_SEARCH is not configured for the instance ..."
+     return ${TRUE?}
+   fi
+
+   echo "(*) Enabling TEXT_SEARCH for database ${dbname?}"
+   su - ${DB2INSTANCE?} -c "db2 connect to ${dbname?};db2 \"create tablespace SYSTOOLSPACE \"; db2 connect reset"
+   sleep 10
+   su - ${DB2INSTANCE?} -c "db2ts \"ENABLE DATABASE FOR TEXT CONNECT TO ${dbname?}\""
+
+   return ${TRUE?}
+}
+
+# Detect if we should upgrade the instance and database by
+# checking the version and release information in CEAL
+detect_upgrade()
+{
+   CEAL=`su - ${DB2INSTANCE?} -c "db2 get dbm cfg | grep CUR_EFF_ARCH_LVL | cut -d= -f2"`
+   current_version=`echo ${CEAL?} | awk '{ print $1 }'`
+   current_release=`echo ${CEAL?} | awk '{ print $2 }'`
+   current_mod=`echo ${CEAL?}| awk '{ print $3 }'`
+   current_fixpak=`echo ${CEAL?} | awk '{ print $4 }'`
+
+   VRMF=`${DB2DIR?}/install/db2ls -c | grep -v \# | awk -F: '{print $2}'`
+   new_version=`echo ${VRMF?} | cut -d. -f1`
+   new_release=`echo ${VRMF?} | cut -d. -f2`
+   new_mod=`echo ${VRMF?} | cut -d. -f3`
+   new_fixpak=`echo ${VRMF?} | cut -d. -f4`
+
+   if [[ ${current_version?} != ${new_version?} ]]; then
+      echo "upgrade"
+   elif [[ ${current_release?} != ${new_release?} ]]; then
+      echo "upgrade"
+   elif [[ ${current_mod?} != ${new_mod?} ]]; then
+      echo "update"
+   elif [[ ${current_fixpak?} != ${new_fixpak?} ]]; then
+      echo "update"
+   else
+      echo ""
+   fi
+}
+
+# Update DB2 code when attaching to an existing storage path but DB2 code has changed. docker run has received an update command
+update_db2_code()
+{
+   dbname=$1
+
+   procedure=$(detect_upgrade)
+
+   if [[ $procedure == "update" ]]; then
+       echo "(*) Updating database ${dbname?} ..."
+       su - ${DB2INSTANCE?} -c "db2start"
+       su - ${DB2INSTANCE?} -c "db2updv115 -d ${dbname?}"
+   elif [[ $procedure == "upgrade" ]]; then
+       echo "(*) Upgrading database ${dbname?} ... "
+       su - ${DB2INSTANCE?} -c "db2start"
+       su - ${DB2INSTANCE?} -c "db2 catalog db ${dbname?} on ${DATA_DIR?}"
+       su - ${DB2INSTANCE?} -c "db2 upgrade db ${dbname?} REBINDALL"
+       su - ${DB2INSTANCE?} -c "db2updv115 -d ${dbname?}"
+   else
+       echo "(*) Code level is the same. No update/upgrade needed."
+   fi   
+
+}
+
+# Apply license to installation
+apply_license()
+{
+   echo "(*) Applying Db2 license ..."
+   if ${DB2DIR?}/adm/db2licm -a ${LICENSE_FILE?}; then
+      save_nodelock_checksum
+   else
+      echo "(!) There was a failure while applying the Db2 license ..."
+   fi
+}
+
+# Import existing license
+import_license()
+{
+   echo "(*) Importing existing license configurations ..."
+   cp ${CONFIG_DIR?}/licenses/nodelock* ${DB2DIR?}/license/
+}
+
+save_nodelock_checksum()
+{
+   echo "(*) Saving the checksum of the current nodelock file ..."
+   checksum=`openssl md5 ${DB2DIR?}/license/nodelock | awk '{print $2}'`
+   if ! ${DB2DIR?}/bin/db2fupdt -f ${CONFIG_DIR?}/instance.cfg -s license -p checksum -v "${checksum?}"; then
+      "(!) Unable to backup the nodelock checksum ..."
+   fi
+}
+
+export_shared_data()
+{
+
+   mkdir -p ${CONFIG_DIR?}
+
+   # Export IP address
+   ip_address=`hostname -i`
+   if ! ${DB2DIR?}/bin/db2fupdt -f ${CONFIG_DIR?}/instance.cfg -s host -p ip_address -v "${ip_address?}"; then
+      "(!) Unable to backup the IP address ..."
+   fi
+
+   # Export database port
+   if ! ${DB2DIR?}/bin/db2fupdt -f ${CONFIG_DIR?}/instance.cfg -s database -p port -v "${DBPORT?}"; then
+      "(!) Unable to backup the database port number ..."
+   fi
+
+   # Export Db2 instance name
+   if ! ${DB2DIR?}/bin/db2fupdt -f ${CONFIG_DIR?}/instance.cfg -s instance -p name -v "${DB2INSTANCE?}"; then
+      "(!) Unable to backup the instance name ..."
+   fi
+}
+
+# Export licenses
+export_config()
+{
+   echo "(*) Exporting instance configurations ... "
+   mkdir -p ${CONFIG_DIR?}/licenses && chown -R ${DB2INSTANCE?}:${INST_GROUP?} ${CONFIG_DIR?}/licenses
+   #Perform initial backup
+   ${SETUPDIR?}/lib/backup_cfg.sh
+
+}
+
+# Import DB/DBM CFG
+import_config()
+{
+    echo "(*) Importing existing instance configuration ... "
+
+    # Import DB and DBM cfg - Should be done only when PERSISTENT_HOME is set to false 
+    su - ${DB2INSTANCE?} -c "db2cfimp ${CONFIG_FILE?}"
+}
+
+create_sample_db()
+{
+   su - ${DB2INSTANCE?} -c "db2sampl"
+}
+
+# Create database
+create_db()
+{
+   dbname=$1
+   echo "(*) Creating database $dbname ... "
+   if su - ${DB2INSTANCE?} -c "db2 create db ${dbname?} using codeset utf-8 territory jp collate using identity"; then
+      su - ${DB2INSTANCE?} -c "db2 activate db ${dbname?}"
+   fi
+}
+
+configure_db()
+{
+   dbname=$1
+
+   # Enabling log archiving does not exit with a zero because of SQL1363W
+   enable_log_archiving ${dbname?}
+   restart_db2
+
+   if ! back_up ${dbname?}; then
+      echo "(!) Failed to back up ${dbname?} database"
+   elif ! run_autoconfig ${dbname?}; then
+      echo "(!) Failed to automatically configure ${dbname?} database"
+   elif ! configure_text_search ${dbname?}; then
+      echo "(!) Failed to configure ${dbname?} database for text search"
+   fi
+}
+
+# Create DSM repository database
+create_repo_db()
+{
+   echo "(*) Creating repository database for DSM ... "
+   su - ${DB2INSTANCE?} -c "db2 create db repodb"
+}
+
+# Fix hosts file
+fix_hosts_file()
+{
+   if [ ! -f /tmp/.host_set ]; then
+
+      echo "(*) Fixing db2nodes file configuration ... "
+
+      cp ${DB2INSTANCE_HOME?}/sqllib/db2nodes.cfg ${DB2INSTANCE_HOME?}/sqllib/db2nodes.cfg.orig
+      new_hostname=`hostname`
+      old_hostname=$(awk '$1 = "0"{print $2; exit}' ${DB2INSTANCE_HOME?}/sqllib/db2nodes.cfg)
+      sed -i s/${old_hostname?}/${new_hostname?}/g ${DB2INSTANCE_HOME?}/sqllib/db2nodes.cfg
+      ${DB2DIR?}/adm/db2set -g DB2SYSTEM=${new_hostname?}
+      touch /tmp/.host_set
+  fi
+}
+
+# Run autoconfig
+run_autoconfig()
+{
+   dbname=$1
+   echo "(*) Applying autoconfiguration for instance ... "
+   cp ${SETUPDIR?}/lib/set_rec_values.sh ${DB2INSTANCE_HOME?}/
+   chown ${DB2INSTANCE?}:${INST_GROUP?} ${DB2INSTANCE_HOME?}/set_rec_values.sh
+   chmod a+x ${DB2INSTANCE_HOME?}/set_rec_values.sh
+
+   su - ${DB2INSTANCE?} -c "${DB2INSTANCE_HOME?}/set_rec_values.sh ${dbname?}"
+}
+
+# Enable BLU
+enable_blu()
+{
+   echo "(*) Enabling analytical workloads for ${DB2INSTANCE?} ... "
+   su - ${DB2INSTANCE?} -c "db2set DB2_WORKLOAD=analytics"
+}
+
+# Enable Oracle Compatibility
+enable_oracle_compat()
+{
+   echo "(*) Enabling Oracle Compatibility for ${DB2INSTANCE?} ... "
+   su - ${DB2INSTANCE?} -c "db2set DB2_COMPATIBILITY_VECTOR=ORA"
+}
+
+# Start DB2
+start_db2()
+{
+   su - ${DB2INSTANCE?} -c "db2gcf -s"
+   return_code=$?
+   if [ ${return_code?} != 0 ]; then
+      echo "DB2 has not been started"
+      echo "Starting DB2..."
+      echo ""
+      su - ${DB2INSTANCE?} -c 'db2start'
+   else
+      echo "DB2 has been started"
+  fi
+}
+
+# Activate database
+activate_db()
+{
+    dbname=$1
+    echo "(*) Activating database $dbname ...."
+    su - ${DB2INSTANCE?} -c "db2 activate db ${dbname?}"
+}
+
+# Catalog DB if existing
+restore_db_from_existing()
+{
+    dbname=$1
+    echo "(*) Cataloging database $dbname on ${DATA_DIR?} ... "
+    su - ${DB2INSTANCE?} -c "db2 catalog db $dbname on ${DATA_DIR?}"
+}
+
+# Re-create services file
+create_services_file()
+{
+   echo "(*) Fixing /etc/services file for DB2 ... "
+   sed -i "/${DB2INSTANCE?}/d" /etc/services
+   cat <<EOF >> /etc/services
+db2c_${DB2INSTANCE?}      50000/tcp
+db2c_${DB2INSTANCE?}_ssl  50001/tcp
+db2j_${DB2INSTANCE?}      55000/tcp
+DB2_${DB2INSTANCE?}       60000/tcp
+DB2_${DB2INSTANCE?}_1     60001/tcp
+DB2_${DB2INSTANCE?}_2     60002/tcp
+DB2_${DB2INSTANCE?}_3     60003/tcp
+DB2_${DB2INSTANCE?}_4     60004/tcp
+DB2_${DB2INSTANCE?}_END   60005/tcp
+EOF
+
+    if [ "${HADR_ENABLED?}" = "true" ]; then
+        sed -i "/db2_hadr/d" /etc/services
+        cat <<EOF >> /etc/services
+db2_hadrp       60006/tcp
+db2_hadrs       60007/tcp
+EOF
+    fi
+}
+
+# Re-register existing instance
+register_instance()
+{
+   echo "(*) Registering existing instance in global registry ... "
+   ${DB2DIR?}/instance/db2iset -a ${DB2INSTANCE?}
+   ${DB2DIR?}/instance/db2iset -cr ${DB2INSTANCE?}
+   ${DB2DIR?}/instance/db2iset -i ${DB2INSTANCE?}
+
+}
+
+#Enable log archiving on docker container (host machine should get files due to mapping)
+enable_log_archiving()
+{
+    dbname=$1
+    su - ${DB2INSTANCE?} -c 'db2start'
+
+    echo "### Enabling LOGARCHMETH1"
+    mkdir -p ${DBLOG_DIR?} && chown ${DB2INSTANCE?}:${INST_GROUP?}  ${DBLOG_DIR?}
+    su - ${DB2INSTANCE?} -c "db2 connect to ${dbname?}; db2 \"update db cfg using LOGARCHMETH1 'DISK:${DBLOG_DIR?}'\""
+
+}
+
+#Perform a backup
+back_up()
+{
+    dbname=$1
+    echo "### Making backup directory and performing backup"
+    mkdir -p ${BACKUP_DIR?} && chown ${DB2INSTANCE?}:${INST_GROUP?} ${BACKUP_DIR?}
+    su - ${DB2INSTANCE?} -c "db2 \"backup db ${dbname?} to ${BACKUP_DIR?}\""
+}
+
+#Restart db2
+restart_db2()
+{
+    echo "### Restarting DB2"
+    su - ${DB2INSTANCE?} -c 'db2stop force; db2start'
+}
+
+# sigterm = docker stop
+on_sigterm()
+{
+    echo "(*) Ending DB2 with db2stop force and db2ts \"stop for text\""
+    su - ${DB2INSTANCE?} -c "db2stop force && db2ts \"stop for text\""
+    echo "(*) Done"
+    exit 0
+}
+
+# We use supervisor to start a bunch of process in the background
+start_supervisor()
+{
+    # Since we are starting sshd in supervisor (outside systemd),
+    # we need to run ssh-keygen -A to generate all non-existent keys
+    /usr/bin/ssh-keygen -A
+    mkdir /var/log/supervisor;/usr/bin/supervisord -c /etc/supervisord.conf
+}
+
+restore_global_registry()
+{
+
+    if [ -f ${CONFIG_DIR?}/global.reg ]; then
+      echo "(*) Restoring global registry file ..."
+
+      mv /var/db2/global.reg /var/db2/global.reg.backup
+      cp ${CONFIG_DIR?}/global.reg /var/db2/global.reg
+      chown root.root /var/db2/global.reg
+      chmod 644 /var/db2/global.reg
+    fi
+}
+
+update_etc_hosts ()
+{
+    local node_name=$1
+    local node_IP=$2
+    local domain=$3
+
+    string_to_add="${node_IP?}    ${node_name?}"
+    if [ -n "${domain?}" ]; then
+        string_to_add="${node_IP?}    ${node_name?}.${domain?}  ${node_name?}"
+    fi
+
+    if ! grep -q "^${string_to_add?}" /etc/hosts; then
+
+        # Could not run sed on /etc/hosts directly for some reason.
+        # On ICP environment, sed may hit
+        # "sed: cannot rename /etc/sedwjx0ZM: Device or resource busy"
+
+        cp /etc/hosts /etc/hosts.backup
+        sed -i "/\<${node_name?}\>/d" /etc/hosts.backup
+        echo "${string_to_add?}" >> /etc/hosts.backup
+        cp /etc/hosts.backup /etc/hosts
+    fi
+
+}
+
+setup_hadr()
+{
+    role=$1
+    instance=$2
+    database=$3
+    rc=${TRUE?}
+    my_hostname=$(hostname -f)
+    my_ip_addr=$(hostname -i)
+    domain=$(dnsdomainname)
+
+    echo "(*) HADR setup phase for instance ${instance?} and database ${database?}..."
+
+    # Add the HADR related entries in /etc/services
+    if ! grep -q ^db2_hadrp /etc/services > /dev/null 2>&1; then
+      echo "db2_hadrp       60006/tcp" >> /etc/services
+    fi
+
+    if ! grep -q ^db2_hadrs /etc/services  > /dev/null 2>&1; then
+      echo "db2_hadrs       60007/tcp" >> /etc/services
+    fi
+
+    # Check for the HADR role in db cfg
+    hadr_db_role=$(get_HADR_role_dbcfg ${instance?} ${database?})
+    if [ "${hadr_db_role?}" = "PRIMARY" -o "${hadr_db_role?}" = "STANDBY" ]; then
+        echo "(*) HADR has been setup previously. Updating hadr.cfg and /etc/hosts ..."
+
+        while [ -f "${HADR_CONFIG_LOCKFILE?}" ]; do
+            echo "(*) Waiting to acquire ${HADR_CONFIG_LOCKFILE?} ..."
+            sleep 
+        done
+
+        touch ${HADR_CONFIG_LOCKFILE?}
+
+        remote_host=$(${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p primary_hostname)
+        role_in_hadr_cfg="standby1_ipaddr"
+        if [ "${my_hostname?}" = "${remote_host?}" ]; then
+            role_in_hadr_cfg="primary_ipaddr"
+        fi
+
+        ${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p ${role_in_hadr_cfg?} -v ${my_ip_addr?}
+
+        rm -f ${HADR_CONFIG_LOCKFILE?}
+
+        ${SETUPDIR?}/lib/fix_etc_host.sh
+
+        return ${rc?}
+    fi
+
+    if [ "PRIMARY" = ${role?} ]; then
+        echo "(*) Setting up as the PRIMARY Server ..."
+
+        ${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p primary_hostname -v ${my_hostname?}
+        ${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p primary_ipaddr -v ${my_ip_addr?}
+
+        while ! ${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p standby1_hostname -q ; do
+          echo "(*) Waiting for STANDBY to write in ${HADR_CONFIG_FILE?}..."
+          sleep 30;
+        done
+        
+        remote_host=$(${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p standby1_hostname)
+        remote_ip=$(${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p standby1_ipaddr)
+    else
+        echo "(*) Setting up as a STANDBY Server ..."
+
+        ${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p standby1_hostname -v ${my_hostname?}
+        ${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p standby1_ipaddr -v ${my_ip_addr?}
+
+        while ! ${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p primary_hostname -q ; do
+          echo "(*) Waiting for PRIMARY to write in ${HADR_CONFIG_FILE?}..."
+          sleep 30;
+        done
+
+        remote_host=$(${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p primary_hostname)
+        remote_ip=$(${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p primary_ipaddr)
+    fi
+
+    # The setup_hadr needs to be executed on the primary before standby
+    if [ "PRIMARY" = ${role?} ]; then
+        echo "(*) Executing setup_hadr on PRIMARY ... "
+
+        if ! setopts=-x \
+             ${SETUPDIR?}/lib/setup_hadr.sh -primary \
+             -use_backup \
+             -remote ${remote_host}:${remote_ip} \
+             -database ${database?} \
+             -instance ${instance?} > /tmp/setup_hadr.log 2>&1; then
+
+            echo "(!!!) There was an error while executing setup on PRIMARY ... "
+            echo "Please check /tmp/setup_hadr.log for more information."
+
+            # Note that .primary_setup_done is not created when there is a failure during
+            # Primary setup. This means that the standby keeps looping until the issue on
+            # the primary is fixed.
+            return ${FALSE?}
+        fi
+
+        touch ${HADR_SHARED_DIR?}/.primary_setup_done
+    else
+
+        while [ ! -f ${HADR_SHARED_DIR?}/.primary_setup_done ]; do
+            echo "(*) Waiting for the PRIMARY to finish executing setup ..."
+            sleep 30;
+        done
+
+        if ! setopts=-x ${SETUPDIR?}/lib/setup_hadr.sh -standby \
+             -use_backup \
+             -remote ${remote_host}:${remote_ip} \
+             -database ${database?} \
+             -instance ${instance?} > /tmp/setup_hadr.log 2>&1; then
+
+            echo "(!!!) There was an error while executing setup on STANDBY ... "
+            echo "Please check /tmp/setup_hadr.log for more information."
+            return ${FALSE?}
+        fi
+
+        # Start the STANDBY before the PRIMARY
+        if ! setopts=-x ${SETUPDIR?}/lib/manage_hadr.sh -start_as standby \
+            -database ${database?} -instance ${instance?} >> /tmp/start_hadr.log 2>&1; then
+
+            echo "(!!!) There was an error while starting HADR on STANDBY ... "
+            echo "Please check /tmp/start_hadr.log for more information."
+            return ${FALSE?}
+        fi
+
+        if ! setopts=-x ${SETUPDIR?}/lib/manage_hadr.sh -enable_acr \
+            -database ${database?} -instance ${instance?} >> /tmp/enable_acr.log 2>&1; then
+
+            echo "(!!!) There was an error while enabling Automatic Client Reroute ..."
+            echo "Please check /tmp/enable_acr.log for more information."
+            rc=${FALSE?}
+        fi
+
+        touch ${HADR_SHARED_DIR?}/.standby_setup_done
+    fi
+
+    # Start PRIMARY after STANDBY is started
+    if [ "PRIMARY" = ${role?} ]; then
+
+        while [ ! -f ${HADR_SHARED_DIR?}/.standby_setup_done ]; do
+           echo "(*) Waiting for the STANDBY host to finish setup before starting HADR ..."
+           sleep 30;
+        done
+
+        if ! setopts=-x ${SETUPDIR?}/lib/manage_hadr.sh -start_as primary \
+            -database ${database?} -instance ${instance?} >> /tmp/start_hadr.log 2>&1; then
+
+            echo "(!!!) There was an error while starting HADR on PRIMARY ... "
+            echo "Please check /tmp/start_hadr.log for more information."
+            return ${FALSE?}
+        fi
+
+        if ! setopts=-x ${SETUPDIR?}/lib/manage_hadr.sh -enable_acr \
+            -database ${database?} -instance ${instance?} >> /tmp/enable_acr.log 2>&1; then
+
+            echo "(!!!) There was an error while enabling Automatic Client Reroute ..."
+            echo "Please check /tmp/enable_acr.log for more information."
+            rc=${FALSE?}
+        fi
+
+    fi
+
+
+    return ${rc?}
+}
+
+setup_governor()
+{
+    role=$1
+    instance=$2
+    database=$3
+    etcd_endpoints=$4
+    etcd_user=$5
+    etcd_password=$6
+    rc=${TRUE?}
+
+    echo "(*) Entering Governor Setup..."
+    rm -rf ${DB2INSTANCE_HOME?}/governor
+    cp -r ${SETUPDIR?}/governor ${DB2INSTANCE_HOME?}/.
+    cd /var/log; mkdir governor; chown ${DB2INSTANCE?}:${INST_GROUP?} governor
+
+    if ! grep -q "^${instance?} ALL=(ALL) ALL" /etc/sudoers; then
+
+      echo "(*) Editing sudoers file..."
+      cat <<EOF >> /etc/sudoers
+${instance?} ALL=(ALL) NOPASSWD: ALL
+EOF
+    fi
+    usermod -aG wheel ${instance?}
+
+    echo "(*) Generating db2.yml file..."
+
+    my_full_hostname=$(hostname -f)
+    standby_full_hostname=$(${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p standby1_hostname)
+    primary_full_hostname=$(${DB2DIR?}/bin/db2fupdt -f ${HADR_SHARED_DIR?}/hadr.cfg -p primary_hostname)
+    if [ "${my_full_hostname?}" = "${standby_full_hostname?}" ]; then
+        remote_full_hostname=${primary_full_hostname?}
+    elif [ "${my_full_hostname?}" = "${primary_full_hostname?}" ]; then
+        remote_full_hostname=${standby_full_hostname?}
+    else
+        echo "(!!!) The current hostname doesn't match either hostname in ${HADR_SHARED_DIR?}/hadr.cfg.. "
+        return ${FALSE?}
+    fi
+
+    if [ -z "${etcd_user?}" -o -z "${etcd_password?}" ]; then
+        etcd_user=${instance?}
+        etcd_password=${DB2INST1_PASSWORD?}
+    fi
+
+    endpoints=($(echo ${etcd_endpoints?} | tr ',' "\n"))
+    joined=$(printf ",'%s'" "${endpoints[@]}")
+
+    cat <<EOF > ${DB2INSTANCE_HOME?}/governor/db2.yml
+timestamp_file: ${DB2INSTANCE_HOME?}/timestamp_file
+force_takeover_window: 300
+startup_time: 600
+loop_wait: 10
+env: prod
+etcd:
+ scope: etcd
+ ttl: 30
+ endpoint: [${joined:1}]
+ cert:
+ timeout: 20
+db2:
+ ip: ${my_full_hostname?}
+ ip_other: ${remote_full_hostname?}
+ db: ${database?}
+ authentication:
+   username: ${etcd_user?}
+   password: ${etcd_password?}
+public_interface:
+op_timeout:
+ connect: 120
+ start: 180
+ start_as_standby: 180
+ start_as_primary: 180
+EOF
+
+    return ${rc?}
+}
